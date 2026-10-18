@@ -1,5 +1,5 @@
 diff --git a/package.json b/package.json
-index 810ff63..3f67fba 100644
+index 810ff63..f411617 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
@@ -10,7 +10,7 @@ index 810ff63..3f67fba 100644
      "description": "Makes judging, compiling, and downloading problems for competitve programming easy. Also supports auto-submit for a few sites.",
      "license": "GPL-3.0-or-later",
      "icon": "icon.png",
-@@ -447,6 +447,27 @@
+@@ -447,6 +447,32 @@
                      "default": false,
                      "description": "%cph.general.showLiveUserCount.description%"
                  },
@@ -29,6 +29,11 @@ index 810ff63..3f67fba 100644
 +                    "items": { "type": "string" },
 +                    "default": [],
 +                    "markdownDescription": "[fork] 「提出用にコピー」で `#include \"...\"` を探すフォルダ(ソースファイルと同じフォルダは常に探す)。例: `~/atcoder/lib`"
++                },
++                "cph.ui.minimal": {
++                    "type": "boolean",
++                    "default": true,
++                    "markdownDescription": "[fork] パネルからカスタム判定スクリプト(未設定時)、サポート/フィードバック等のボタン、ONLINE_JUDGE 切り替えを隠す。変更後はウィンドウの再読み込みが必要"
 +                },
 +                "cph.bundle.implMarker": {
 +                    "type": "string",
@@ -403,10 +408,10 @@ index 0000000..7d14185
 +    }
 +};
 diff --git a/src/preferences.ts b/src/preferences.ts
-index 612065f..e3f2d5e 100644
+index 612065f..b27bcd1 100644
 --- a/src/preferences.ts
 +++ b/src/preferences.ts
-@@ -249,3 +249,18 @@ export const getLanguageId = (srcPath: string): number => {
+@@ -249,3 +249,21 @@ export const getLanguageId = (srcPath: string): number => {
      globalThis.logger.error("Couldn't find id for compiler " + compiler);
      return -1;
  };
@@ -425,6 +430,9 @@ index 612065f..e3f2d5e 100644
 +
 +export const getBundleImplMarker = (): string =>
 +    getPreference('bundle.implMarker') || '@impl';
++
++export const getMinimalUiPref = (): boolean =>
++    getPreference('ui.minimal') ?? true;
 diff --git a/src/problemPath.ts b/src/problemPath.ts
 new file mode 100644
 index 0000000..47dfd9e
@@ -807,10 +815,10 @@ index 0000000..10bfa1e
 +    });
 +});
 diff --git a/src/types.ts b/src/types.ts
-index e6e87a0..9da7627 100644
+index e6e87a0..7c151cc 100644
 --- a/src/types.ts
 +++ b/src/types.ts
-@@ -61,7 +61,11 @@ export type prefSection =
+@@ -61,7 +61,12 @@ export type prefSection =
      | 'general.doTemplateFileVariableReplacement'
      | 'general.remoteServerAddress'
      | 'general.showLiveUserCount'
@@ -819,11 +827,12 @@ index e6e87a0..9da7627 100644
 +    | 'general.problemDirectory'
 +    | 'general.problemFileName'
 +    | 'bundle.includePaths'
-+    | 'bundle.implMarker';
++    | 'bundle.implMarker'
++    | 'ui.minimal';
  
  export type Language = {
      name: LangNames;
-@@ -223,7 +227,13 @@ export type OpenFile = {
+@@ -223,7 +228,13 @@ export type OpenFile = {
      path: string;
  };
  
@@ -838,10 +847,15 @@ index e6e87a0..9da7627 100644
      | GetInitialProblem
      | CreateLocalProblem
 diff --git a/src/webview/JudgeView.ts b/src/webview/JudgeView.ts
-index f146318..cd9bc7e 100644
+index f146318..9eff70e 100644
 --- a/src/webview/JudgeView.ts
 +++ b/src/webview/JudgeView.ts
-@@ -25,6 +25,7 @@ import {
+@@ -21,10 +21,12 @@ import {
+     getHideOutputDifferencePref,
+     updatePreference,
+     getPythonCommand,
++    getMinimalUiPref,
+ } from '../preferences';
  import { setOnlineJudgeEnv, onlineJudgeEnv } from '../compiler';
  import { translations } from './translations';
  import { serializeForInlineScript } from '../utilsPure';
@@ -849,7 +863,7 @@ index f146318..cd9bc7e 100644
  
  class JudgeViewProvider implements vscode.WebviewViewProvider {
      public static readonly viewType = 'cph.judgeView';
-@@ -54,6 +55,11 @@ class JudgeViewProvider implements vscode.WebviewViewProvider {
+@@ -54,6 +56,11 @@ class JudgeViewProvider implements vscode.WebviewViewProvider {
              async (message: WebviewToVSEvent) => {
                  globalThis.logger.log('Got from webview', message);
                  switch (message.command) {
@@ -861,11 +875,28 @@ index f146318..cd9bc7e 100644
                      case 'run-single-and-save': {
                          const problem = message.problem;
                          const id = message.id;
+@@ -360,6 +367,7 @@ class JudgeViewProvider implements vscode.WebviewViewProvider {
+             generatedJsonUri: generatedJsonUri.toString(),
+             remoteServerAddress,
+             showLiveUserCount,
++            minimalUI: getMinimalUiPref(),
+             showOutputDifference: !getHideOutputDifferencePref(),
+             translations: translation,
+             pythonCommand,
 diff --git a/src/webview/frontend/App.tsx b/src/webview/frontend/App.tsx
-index 77dcac5..23140a1 100644
+index 77dcac5..8b1cde3 100644
 --- a/src/webview/frontend/App.tsx
 +++ b/src/webview/frontend/App.tsx
-@@ -434,6 +434,14 @@ function Judge(props: {
+@@ -45,6 +45,8 @@ interface CustomWindow extends Window {
+     remoteMessage: string | null;
+     remoteServerAddress: string;
+     showLiveUserCount: boolean;
++    /** [fork] 不要なボタン類を隠す */
++    minimalUI?: boolean;
+     console: Console;
+     translations: Record<string, string>;
+     pythonCommand: string;
+@@ -434,6 +436,14 @@ function Judge(props: {
          setWaitingForSubmit(true);
      };
  
@@ -880,23 +911,525 @@ index 77dcac5..23140a1 100644
      const submitCf = () => {
          sendMessageToVSCode({
              command: 'submitCf',
-@@ -951,6 +959,16 @@ function Judge(props: {
-                             </span>{' '}
-                             {t('newTestcase')}
-                         </button>
+@@ -940,19 +950,7 @@ function Judge(props: {
+             <div className="results">{views}</div>
+             <div className="margin-10">
+                 <div className="action-container">
+-                    <div className="button-grid">
+-                        <button
+-                            className="btn btn-green btn-block"
+-                            onClick={newCase}
+-                            title={t('newTestcase')}
+-                        >
+-                            <span className="icon">
+-                                <i className="codicon codicon-add"></i>
+-                            </span>{' '}
+-                            {t('newTestcase')}
+-                        </button>
+-                        {renderSubmitButton()}
+-                    </div>
++                    {/* [fork] 新しいテストケース・提出用にコピーは下部の固定バーへ移動 */}
+                     {waitingForSubmit && (
+                         <div className="margin-10">
+                             {submitServerFailed ? (
+@@ -1005,25 +1003,29 @@ function Judge(props: {
+                             )}
+                         </div>
+                     )}
+-                    <button
+-                        className={`btn btn-block ${
+-                            problem.customCheckerPath?.trim()
+-                                ? 'btn-orange'
+-                                : ''
+-                        }`}
+-                        onClick={toggleChecker}
+-                    >
+-                        <span className="icon">
+-                            <i
+-                                className={`codicon codicon-chevron-${
+-                                    checkerVisible ? 'up' : 'down'
+-                                }`}
+-                            ></i>
+-                        </span>{' '}
+-                        {problem.customCheckerPath?.trim()
+-                            ? t('customCheckerEnabled')
+-                            : t('customChecker')}
+-                    </button>
++                    {/* [fork] 判定スクリプト未使用なら隠す */}
++                    {(!window.minimalUI ||
++                        !!problem.customCheckerPath?.trim()) && (
 +                        <button
-+                            className="btn btn-block"
-+                            onClick={copyBundled}
-+                            title={t('copyForSubmit')}
++                            className={`btn btn-block ${
++                                problem.customCheckerPath?.trim()
++                                    ? 'btn-orange'
++                                    : ''
++                            }`}
++                            onClick={toggleChecker}
 +                        >
 +                            <span className="icon">
-+                                <i className="codicon codicon-copy"></i>
++                                <i
++                                    className={`codicon codicon-chevron-${
++                                        checkerVisible ? 'up' : 'down'
++                                    }`}
++                                ></i>
 +                            </span>{' '}
-+                            {t('copyForSubmit')}
++                            {problem.customCheckerPath?.trim()
++                                ? t('customCheckerEnabled')
++                                : t('customChecker')}
 +                        </button>
-                         {renderSubmitButton()}
++                    )}
+                 </div>
+                 {checkerVisible && (
+                     <div className="pad-10 custom-checker-area">
+@@ -1146,80 +1148,22 @@ with open(sys.argv[2], "r") as f:
+                         </details>
                      </div>
-                     {waitingForSubmit && (
+                 )}
+-                <small className="footer-button-grid">
+-                    <a
+-                        href={payPalUrl}
+-                        className="btn btn-black footer-btn-row-2"
+-                        title={t('donate')}
+-                    >
+-                        <i className="codicon codicon-heart-filled"></i>{' '}
+-                        {t('support')}
+-                    </a>
+-                    <span
+-                        className="footer-btn-row-2"
+-                        style={{ position: 'relative' }}
+-                    >
+-                        {showFeedbackTooltip && (
+-                            <div
+-                                className="feedback-tooltip"
+-                                style={{
+-                                    display: 'flex',
+-                                    alignItems: 'center',
+-                                    gap: '6px',
+-                                }}
+-                            >
+-                                <span>{t('feedbackTooltip')}</span>
+-                                <a
+-                                    role="button"
+-                                    style={{
+-                                        cursor: 'pointer',
+-                                        color: 'white',
+-                                        opacity: 0.8,
+-                                        display: 'inline-flex',
+-                                        alignItems: 'center',
+-                                    }}
+-                                    onClick={(e) => {
+-                                        e.stopPropagation();
+-                                        e.preventDefault();
+-                                        setShowFeedbackTooltip(false);
+-                                        updateWebviewState({
+-                                            ...webviewState,
+-                                            hasSeenFeedbackTooltip: true,
+-                                        });
+-                                    }}
+-                                    title="Close"
+-                                >
+-                                    <i
+-                                        className="codicon codicon-close"
+-                                        style={{ fontSize: '10px' }}
+-                                    ></i>
+-                                </a>
+-                            </div>
+-                        )}
++                {/* [fork] サポート・フィードバック等を隠す */}
++                {!window.minimalUI && (
++                    <small className="footer-button-grid">
+                         <a
+-                            role="button"
+-                            className="btn btn-black"
+-                            onClick={() => setFeedbackPageVisible(true)}
++                            href={payPalUrl}
++                            className="btn btn-black footer-btn-row-2"
++                            title={t('donate')}
+                         >
+-                            <i className="codicon codicon-feedback"></i>{' '}
+-                            {t('feedback')}
++                            <i className="codicon codicon-heart-filled"></i>{' '}
++                            {t('support')}
+                         </a>
+-                    </span>
+-                    <a
+-                        role="button"
+-                        className="btn btn-black footer-btn-row-2"
+-                        title={t('importTooltip')}
+-                        onClick={() => setImportPageVisible(true)}
+-                    >
+-                        <i className="codicon codicon-cloud-upload"></i>{' '}
+-                        {t('import')}
+-                    </a>
+-                    <span
+-                        className="footer-btn-row-2"
+-                        style={{ position: 'relative' }}
+-                    >
+-                        {showCompanionTooltip &&
+-                            !webviewState.catCompanionEnabled && (
++                        <span
++                            className="footer-btn-row-2"
++                            style={{ position: 'relative' }}
++                        >
++                            {showFeedbackTooltip && (
+                                 <div
+                                     className="feedback-tooltip"
+                                     style={{
+@@ -1228,7 +1172,7 @@ with open(sys.argv[2], "r") as f:
+                                         gap: '6px',
+                                     }}
+                                 >
+-                                    <span>{t('companionTooltip')}</span>
++                                    <span>{t('feedbackTooltip')}</span>
+                                     <a
+                                         role="button"
+                                         style={{
+@@ -1241,10 +1185,10 @@ with open(sys.argv[2], "r") as f:
+                                         onClick={(e) => {
+                                             e.stopPropagation();
+                                             e.preventDefault();
+-                                            setShowCompanionTooltip(false);
++                                            setShowFeedbackTooltip(false);
+                                             updateWebviewState({
+                                                 ...webviewState,
+-                                                hasSeenCompanionTooltip: true,
++                                                hasSeenFeedbackTooltip: true,
+                                             });
+                                         }}
+                                         title="Close"
+@@ -1256,52 +1200,121 @@ with open(sys.argv[2], "r") as f:
+                                     </a>
+                                 </div>
+                             )}
++                            <a
++                                role="button"
++                                className="btn btn-black"
++                                onClick={() => setFeedbackPageVisible(true)}
++                            >
++                                <i className="codicon codicon-feedback"></i>{' '}
++                                {t('feedback')}
++                            </a>
++                        </span>
+                         <a
+                             role="button"
+-                            className="btn btn-black"
+-                            title={
+-                                webviewState.catCompanionEnabled
+-                                    ? t('disableCatCompanion')
+-                                    : t('enableCatCompanion')
+-                            }
+-                            onClick={() => {
+-                                updateWebviewState({
+-                                    ...webviewState,
+-                                    catCompanionEnabled:
+-                                        !webviewState.catCompanionEnabled,
+-                                    hasSeenCompanionTooltip: true,
+-                                });
+-                            }}
++                            className="btn btn-black footer-btn-row-2"
++                            title={t('importTooltip')}
++                            onClick={() => setImportPageVisible(true)}
+                         >
+-                            <i className="codicon codicon-octoface"></i>{' '}
+-                            {t('cat')}
++                            <i className="codicon codicon-cloud-upload"></i>{' '}
++                            {t('import')}
+                         </a>
+-                    </span>
+-                    <a
+-                        href="https://github.com/agrawal-d/cph/issues"
+-                        className="btn btn-black footer-btn-row-2"
+-                    >
+-                        <i className="codicon codicon-github"></i> {t('bugs')}
+-                    </a>
+-                    <a
+-                        role="button"
+-                        className="btn btn-black footer-btn-row-2"
+-                        title={t('aboutCPH')}
+-                        onClick={() => showInfoPage()}
+-                    >
+-                        <i className="codicon codicon-info"></i> {t('about')}
+-                    </a>
+-                </small>
++                        <span
++                            className="footer-btn-row-2"
++                            style={{ position: 'relative' }}
++                        >
++                            {showCompanionTooltip &&
++                                !webviewState.catCompanionEnabled && (
++                                    <div
++                                        className="feedback-tooltip"
++                                        style={{
++                                            display: 'flex',
++                                            alignItems: 'center',
++                                            gap: '6px',
++                                        }}
++                                    >
++                                        <span>{t('companionTooltip')}</span>
++                                        <a
++                                            role="button"
++                                            style={{
++                                                cursor: 'pointer',
++                                                color: 'white',
++                                                opacity: 0.8,
++                                                display: 'inline-flex',
++                                                alignItems: 'center',
++                                            }}
++                                            onClick={(e) => {
++                                                e.stopPropagation();
++                                                e.preventDefault();
++                                                setShowCompanionTooltip(false);
++                                                updateWebviewState({
++                                                    ...webviewState,
++                                                    hasSeenCompanionTooltip:
++                                                        true,
++                                                });
++                                            }}
++                                            title="Close"
++                                        >
++                                            <i
++                                                className="codicon codicon-close"
++                                                style={{ fontSize: '10px' }}
++                                            ></i>
++                                        </a>
++                                    </div>
++                                )}
++                            <a
++                                role="button"
++                                className="btn btn-black"
++                                title={
++                                    webviewState.catCompanionEnabled
++                                        ? t('disableCatCompanion')
++                                        : t('enableCatCompanion')
++                                }
++                                onClick={() => {
++                                    updateWebviewState({
++                                        ...webviewState,
++                                        catCompanionEnabled:
++                                            !webviewState.catCompanionEnabled,
++                                        hasSeenCompanionTooltip: true,
++                                    });
++                                }}
++                            >
++                                <i className="codicon codicon-octoface"></i>{' '}
++                                {t('cat')}
++                            </a>
++                        </span>
++                        <a
++                            href="https://github.com/agrawal-d/cph/issues"
++                            className="btn btn-black footer-btn-row-2"
++                        >
++                            <i className="codicon codicon-github"></i>{' '}
++                            {t('bugs')}
++                        </a>
++                        <a
++                            role="button"
++                            className="btn btn-black footer-btn-row-2"
++                            title={t('aboutCPH')}
++                            onClick={() => showInfoPage()}
++                        >
++                            <i className="codicon codicon-info"></i>{' '}
++                            {t('about')}
++                        </a>
++                    </small>
++                )}
+                 <div>
+-                    <span
+-                        onClick={toggleOnlineJudgeEnv}
+-                        className={`oj-box ${
+-                            onlineJudgeEnv ? 'oj-enabled' : ''
+-                        }`}
+-                    >
+-                        {onlineJudgeEnv ? '☑' : '☐'}{' '}
+-                        <span className="oj-code">{t('setOnlineJudge')}</span>
+-                    </span>
++                    {/* [fork] ONLINE_JUDGE 切り替えを隠す */}
++                    {!window.minimalUI && (
++                        <span
++                            onClick={toggleOnlineJudgeEnv}
++                            className={`oj-box ${
++                                onlineJudgeEnv ? 'oj-enabled' : ''
++                            }`}
++                        >
++                            {onlineJudgeEnv ? '☑' : '☐'}{' '}
++                            <span className="oj-code">
++                                {t('setOnlineJudge')}
++                            </span>
++                        </span>
++                    )}
+                     {renderTimeoutAVSuggestion()}
+                 </div>
+                 <div className="remote-message">
+@@ -1328,59 +1341,84 @@ with open(sys.argv[2], "r") as f:
+                         numPassed={numPassed}
+                     />
+                 )}
+-                <div className="split-btn">
++                <div className="button-grid fork-actions-grid">
+                     <button
+-                        className="btn main-btn"
+-                        onClick={runAll}
+-                        title={t('runAll')}
++                        className="btn btn-green btn-block"
++                        onClick={newCase}
++                        title={t('newTestcase')}
+                     >
+                         <span className="icon">
+-                            <i className="codicon codicon-run-above"></i>
++                            <i className="codicon codicon-add"></i>
+                         </span>{' '}
+-                        <span className="action-text">{t('runAll')}</span>
++                        {t('newTestcase')}
+                     </button>
+                     <button
+-                        className="btn chevron-btn"
+-                        title={t('moreActions')}
+-                        onClick={(e) => {
+-                            e.preventDefault();
+-                            e.stopPropagation();
+-                            const event = new MouseEvent('contextmenu', {
+-                                bubbles: true,
+-                                clientX: e.clientX,
+-                                clientY: e.clientY,
+-                            });
+-                            e.currentTarget.dispatchEvent(event);
+-                        }}
+-                        data-vscode-context='{"preventDefaultContextMenuItems": true, "webviewSection": "compile-button"}'
++                        className="btn btn-block"
++                        onClick={copyBundled}
++                        title={t('copyForSubmit')}
++                    >
++                        <span className="icon">
++                            <i className="codicon codicon-copy"></i>
++                        </span>{' '}
++                        {t('copyForSubmit')}
++                    </button>
++                    {renderSubmitButton()}
++                </div>
++                <div className="fork-actions-row">
++                    <div className="split-btn">
++                        <button
++                            className="btn main-btn"
++                            onClick={runAll}
++                            title={t('runAll')}
++                        >
++                            <span className="icon">
++                                <i className="codicon codicon-run-above"></i>
++                            </span>{' '}
++                            <span className="action-text">{t('runAll')}</span>
++                        </button>
++                        <button
++                            className="btn chevron-btn"
++                            title={t('moreActions')}
++                            onClick={(e) => {
++                                e.preventDefault();
++                                e.stopPropagation();
++                                const event = new MouseEvent('contextmenu', {
++                                    bubbles: true,
++                                    clientX: e.clientX,
++                                    clientY: e.clientY,
++                                });
++                                e.currentTarget.dispatchEvent(event);
++                            }}
++                            data-vscode-context='{"preventDefaultContextMenuItems": true, "webviewSection": "compile-button"}'
++                        >
++                            <span className="icon">
++                                <i className="codicon codicon-chevron-down"></i>
++                            </span>
++                        </button>
++                    </div>
++                    <button
++                        className="btn btn-red delete-btn"
++                        onClick={deleteTcs}
++                        title={t('delete')}
+                     >
+                         <span className="icon">
+-                            <i className="codicon codicon-chevron-down"></i>
++                            <i className="codicon codicon-trash"></i>
++                        </span>
++                    </button>
++                    <button
++                        className="btn btn-yellow settings-btn"
++                        title={t('settings')}
++                        onClick={() =>
++                            sendMessageToVSCode({
++                                command: 'open-settings',
++                            })
++                        }
++                    >
++                        <span className="icon">
++                            <i className="codicon codicon-settings"></i>
+                         </span>
+                     </button>
+                 </div>
+-                <button
+-                    className="btn btn-red delete-btn"
+-                    onClick={deleteTcs}
+-                    title={t('delete')}
+-                >
+-                    <span className="icon">
+-                        <i className="codicon codicon-trash"></i>
+-                    </span>
+-                </button>
+-                <button
+-                    className="btn btn-yellow settings-btn"
+-                    title={t('settings')}
+-                    onClick={() =>
+-                        sendMessageToVSCode({
+-                            command: 'open-settings',
+-                        })
+-                    }
+-                >
+-                    <span className="icon">
+-                        <i className="codicon codicon-settings"></i>
+-                    </span>
+-                </button>
+             </div>
+         </div>
+     );
+diff --git a/src/webview/frontend/app.css b/src/webview/frontend/app.css
+index 370b7bd..092bda2 100644
+--- a/src/webview/frontend/app.css
++++ b/src/webview/frontend/app.css
+@@ -71,7 +71,8 @@ body {
+ }
+ 
+ #app {
+-    margin-bottom: 65px;
++    /* [fork] 下部の固定バーが2段になったぶん余白を増やす */
++    margin-bottom: 110px;
+ }
+ 
+ .btn:hover {
+@@ -94,9 +95,10 @@ body {
+     border-radius: 0px !important;
+     box-sizing: border-box;
+     display: flex !important;
+-    flex-direction: row !important;
++    /* [fork] 上段: 新しいテストケース等 / 下段: すべて実行等 */
++    flex-direction: column !important;
+     align-items: stretch !important;
+-    gap: 8px !important;
++    gap: 6px !important;
+ }
+ 
+ .actions .split-btn,
+@@ -1047,3 +1049,15 @@ body.vscode-light .btn .color-orange {
+ .footer-btn-row-2 {
+     grid-column: span 2;
+ }
++
++/* [fork] 固定バーの下段(すべて実行・削除・設定) */
++.actions .fork-actions-row {
++    display: flex;
++    flex-direction: row;
++    align-items: stretch;
++    gap: 8px;
++}
++
++.actions .fork-actions-grid .btn {
++    margin: 0 !important;
++}
 diff --git a/src/webview/translations.ts b/src/webview/translations.ts
 index 04ac6f2..df427eb 100644
 --- a/src/webview/translations.ts
