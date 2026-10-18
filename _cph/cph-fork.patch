@@ -1,0 +1,943 @@
+diff --git a/package.json b/package.json
+index 810ff63..3f67fba 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+     "name": "competitive-programming-helper",
+-    "displayName": "Competitive Programming Helper (cph)",
++    "displayName": "Competitive Programming Helper (cph) [fork]",
+     "description": "Makes judging, compiling, and downloading problems for competitve programming easy. Also supports auto-submit for a few sites.",
+     "license": "GPL-3.0-or-later",
+     "icon": "icon.png",
+@@ -447,6 +447,27 @@
+                     "default": false,
+                     "description": "%cph.general.showLiveUserCount.description%"
+                 },
++                "cph.general.problemDirectory": {
++                    "type": "string",
++                    "default": "",
++                    "markdownDescription": "[fork] Competitive Companion から取り込んだ問題ファイルを作るフォルダ。空ならワークスペース直下。使える変数: `${workspaceFolder}` `${contest}`(例: abc400) `${task}`(例: abc400_a) `${index}`(例: a) `${group}`。相対パスはワークスペースからの相対、`~` はホーム。例: `${workspaceFolder}/${contest}`"
++                },
++                "cph.general.problemFileName": {
++                    "type": "string",
++                    "default": "",
++                    "markdownDescription": "[fork] 問題ファイル名(拡張子なし)。空なら cph 標準の名前。変数は problemDirectory と同じ。例: `${index}` → `a.cpp`"
++                },
++                "cph.bundle.includePaths": {
++                    "type": "array",
++                    "items": { "type": "string" },
++                    "default": [],
++                    "markdownDescription": "[fork] 「提出用にコピー」で `#include \"...\"` を探すフォルダ(ソースファイルと同じフォルダは常に探す)。例: `~/atcoder/lib`"
++                },
++                "cph.bundle.implMarker": {
++                    "type": "string",
++                    "default": "@impl",
++                    "markdownDescription": "[fork] ライブラリ内でこの目印(`// @impl`)の行より下を main の後ろへ移動する"
++                },
+                 "cph.general.hideOutputDifference": {
+                     "type": "boolean",
+                     "default": true,
+diff --git a/src/bundler.ts b/src/bundler.ts
+new file mode 100644
+index 0000000..4dbc52c
+--- /dev/null
++++ b/src/bundler.ts
+@@ -0,0 +1,214 @@
++/**
++ * [fork] 提出用バンドラー(vscode に依存しない純粋なモジュール)
++ *
++ * - `#include "..."` を再帰的に展開する(山括弧の <...> はそのまま残す)
++ * - 同じファイルは一度だけ展開する(#pragma once / インクルードガード相当)
++ *   展開したファイルの `#pragma once` とインクルードガードは取り除く
++ * - ライブラリ内に `// @impl` 行があれば、その行より上は include した位置に、
++ *   下は元ファイルの末尾(main の後ろ)にまとめて出力する
++ * - `#ifdef LOCAL` などの条件ブロックの中で include されたファイルは、
++ *   分割すると条件の外に出てしまうので、@impl を無視してその場に丸ごと展開する
++ */
++import fs from 'fs';
++import os from 'os';
++import path from 'path';
++
++export type BundleResult = {
++    code: string;
++    expandedFiles: string[];
++    unresolved: string[];
++    warnings: string[];
++};
++
++const INCLUDE_RE = /^\s*#\s*include\s*"([^"]+)"/;
++const PRAGMA_ONCE_RE = /^\s*#\s*pragma\s+once\b/;
++const IF_RE = /^\s*#\s*if(n?def)?\b/;
++const ENDIF_RE = /^\s*#\s*endif\b/;
++
++const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++
++/** `~` と `${workspaceFolder}` を展開し、相対パスは workspaceFolder 基準にする */
++export const expandPathVars = (p: string, workspaceFolder: string): string => {
++    let ret = p.trim().replace(/\$\{workspaceFolder\}/g, workspaceFolder);
++    if (ret === '~') {
++        ret = os.homedir();
++    } else if (ret.startsWith('~/')) {
++        ret = path.join(os.homedir(), ret.slice(2));
++    }
++    if (!path.isAbsolute(ret)) {
++        ret = path.join(workspaceFolder, ret);
++    }
++    return ret;
++};
++
++/**
++ * 先頭の `#ifndef X` + `#define X` と、それに対応する末尾の `#endif` を
++ * インクルードガードとみなして取り除く。ガードでなければそのまま返す。
++ */
++export const stripIncludeGuard = (lines: string[]): string[] => {
++    const isBlank = (l: string) => /^\s*(\/\/.*)?$/.test(l);
++    let i = 0;
++    while (i < lines.length && isBlank(lines[i])) i++;
++    const ifndef = lines[i]?.match(/^\s*#\s*ifndef\s+(\w+)\s*(\/\/.*)?$/);
++    if (!ifndef) return lines;
++    let j = i + 1;
++    while (j < lines.length && isBlank(lines[j])) j++;
++    const define = lines[j]?.match(/^\s*#\s*define\s+(\w+)\s*(\/\/.*)?$/);
++    if (!define || define[1] !== ifndef[1]) return lines;
++
++    // 末尾の #endif を探し、それが先頭の #ifndef と対応しているか確認する
++    let k = lines.length - 1;
++    while (k > j && /^\s*(\/\/.*|\/\*.*\*\/)?\s*$/.test(lines[k])) k--;
++    if (k <= j || !ENDIF_RE.test(lines[k])) return lines;
++    let depth = 0;
++    for (let x = j + 1; x < k; x++) {
++        if (IF_RE.test(lines[x])) depth++;
++        else if (ENDIF_RE.test(lines[x])) {
++            depth--;
++            if (depth < 0) return lines; // 途中でガードが閉じている
++        }
++    }
++    if (depth !== 0) return lines;
++    return [
++        ...lines.slice(0, i),
++        ...lines.slice(j + 1, k),
++        ...lines.slice(k + 1),
++    ];
++};
++
++export const bundleSource = (
++    rootPath: string,
++    rootText: string,
++    includePaths: string[],
++    implMarker: string,
++): BundleResult => {
++    const markerRe = new RegExp(
++        `^\\s*//\\s*${escapeRegExp(implMarker.trim() || '@impl')}(?![\\w-])`,
++    );
++    // 無条件に展開済みのファイル(以後の include は省略してよい)
++    const visited = new Set<string>();
++    const expandedFiles: string[] = [];
++    const unresolved: string[] = [];
++    const tails: string[] = [];
++    const warnings: string[] = [];
++    // 展開中のファイル(循環 include の検出用)
++    const stack = new Set<string>();
++
++    const resolve = (name: string, fromDir: string): string | null => {
++        const candidates = [fromDir, ...includePaths].map((dir) =>
++            path.resolve(dir, name),
++        );
++        for (const c of candidates) {
++            try {
++                if (fs.statSync(c).isFile()) {
++                    return fs.realpathSync(c);
++                }
++            } catch (_) {
++                // 存在しない候補は無視
++            }
++        }
++        return null;
++    };
++
++    /**
++     * lines を処理し、include 位置に置く行を返す。分割した impl 部分は tails に積む。
++     * inCond: この lines 全体が条件ブロック(#if 系)の中にあるか
++     */
++    const expand = (
++        lines: string[],
++        filePath: string,
++        inCond: boolean,
++    ): string[] => {
++        const out: string[] = [];
++        const dir = path.dirname(filePath);
++        let depth = 0;
++        for (const line of lines) {
++            if (PRAGMA_ONCE_RE.test(line)) {
++                continue;
++            }
++            if (IF_RE.test(line)) depth++;
++            else if (ENDIF_RE.test(line)) depth = Math.max(0, depth - 1);
++
++            const m = line.match(INCLUDE_RE);
++            if (!m) {
++                out.push(line);
++                continue;
++            }
++            const resolved = resolve(m[1], dir);
++            if (resolved === null) {
++                unresolved.push(m[1]);
++                out.push(line);
++                continue;
++            }
++            if (visited.has(resolved) || stack.has(resolved)) {
++                continue;
++            }
++            const conditional = inCond || depth > 0;
++            if (!conditional) {
++                visited.add(resolved);
++            }
++            if (!expandedFiles.includes(resolved)) {
++                expandedFiles.push(resolved);
++            }
++
++            const fileLines = stripIncludeGuard(
++                fs.readFileSync(resolved, 'utf8').split(/\r?\n/),
++            );
++            let markerIdx = conditional
++                ? -1
++                : fileLines.findIndex((l) => markerRe.test(l));
++            if (markerIdx !== -1) {
++                // 目印が #if 系ブロックの中にあると分割で壊れるので分割しない
++                let d = 0;
++                for (let x = 0; x < markerIdx; x++) {
++                    if (IF_RE.test(fileLines[x])) d++;
++                    else if (ENDIF_RE.test(fileLines[x]))
++                        d = Math.max(0, d - 1);
++                }
++                if (d > 0) {
++                    warnings.push(
++                        `${m[1]}: ${implMarker} が #if/#ifdef ブロックの中にあるため、分割せずに展開しました`,
++                    );
++                    markerIdx = -1;
++                }
++            }
++            const head =
++                markerIdx === -1 ? fileLines : fileLines.slice(0, markerIdx);
++            const impl = markerIdx === -1 ? [] : fileLines.slice(markerIdx + 1);
++
++            stack.add(resolved);
++            out.push(`// ===== begin: ${m[1]} =====`);
++            out.push(...expand(head, resolved, conditional));
++            out.push(`// ===== end: ${m[1]} =====`);
++            if (impl.length > 0) {
++                const implOut = expand(impl, resolved, false);
++                tails.push(
++                    [`// ===== impl: ${m[1]} =====`, ...implOut]
++                        .join('\n')
++                        .replace(/\s+$/, ''),
++                );
++            }
++            stack.delete(resolved);
++        }
++        return out;
++    };
++
++    let rootReal = rootPath;
++    try {
++        rootReal = fs.realpathSync(rootPath);
++    } catch (_) {
++        // 未保存などで実体がない場合はそのまま
++    }
++    visited.add(rootReal);
++    stack.add(rootReal);
++    let code = expand(rootText.split(/\r?\n/), rootReal, false).join('\n');
++    if (tails.length > 0) {
++        code = code.replace(/\s*$/, '\n') + '\n' + tails.join('\n\n') + '\n';
++    }
++    return {
++        code,
++        expandedFiles,
++        unresolved: [...new Set(unresolved)],
++        warnings,
++    };
++};
+diff --git a/src/companion.ts b/src/companion.ts
+index 31c13cd..205b5b0 100644
+--- a/src/companion.ts
++++ b/src/companion.ts
+@@ -4,7 +4,7 @@ import { Problem, CphSubmitResponse, CphEmptyResponse } from './types';
+ import { saveProblem } from './parser';
+ import * as vscode from 'vscode';
+ import path from 'path';
+-import { writeFileSync, readFileSync, existsSync } from 'fs';
++import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
+ import { isCodeforcesUrl, isLuoguUrl, isAtCoderUrl, randomId } from './utils';
+ import {
+     getDefaultLangPref,
+@@ -17,6 +17,8 @@ import {
+     includeProblemIndex,
+     wordRegex,
+     doTemplateFileVariableReplacement,
++    getProblemDirectoryPref,
++    getProblemFileNamePref,
+ } from './preferences';
+ import { getProblemName } from './submit';
+ import { spawn } from 'child_process';
+@@ -25,6 +27,7 @@ import { words_in_text, toPascalCase } from './utilsPure';
+ import telmetry from './telmetry';
+ import os from 'os';
+ import localize from './i18n';
++import { getProblemPathVars, resolveProblemPath } from './problemPath';
+ 
+ const emptyResponse: CphEmptyResponse = { empty: true };
+ let savedResponse: CphEmptyResponse | CphSubmitResponse = emptyResponse;
+@@ -270,8 +273,33 @@ const handleNewProblem = async (problem: Problem) => {
+         const splitUrl = problem.url.split('/');
+         problem.name = splitUrl[splitUrl.length - 1];
+     }
+-    const problemFileName = getProblemFileName(problem, extn);
+-    const srcPath = path.join(folder, problemFileName);
++    // [fork] 保存先フォルダ・ファイル名をテンプレートで指定可能にする
++    let problemFileName = getProblemFileName(problem, extn);
++    const resolvedPath = resolveProblemPath(
++        getProblemDirectoryPref(),
++        getProblemFileNamePref(),
++        getProblemPathVars(problem.url, problem.group, folder),
++    );
++    if (resolvedPath.unknown.length > 0) {
++        vscode.window.showWarningMessage(
++            `[cph fork] 未知の変数を空文字として扱いました: ${resolvedPath.unknown
++                .map((v) => '${' + v + '}')
++                .join(', ')}`,
++        );
++    }
++    if (resolvedPath.baseName !== null) {
++        problemFileName = `${resolvedPath.baseName}.${extn}`;
++    }
++    const targetDir = resolvedPath.dir;
++    try {
++        mkdirSync(targetDir, { recursive: true });
++    } catch (err: any) {
++        vscode.window.showErrorMessage(
++            `[cph fork] フォルダを作成できませんでした: ${targetDir} (${err.message})`,
++        );
++        return;
++    }
++    const srcPath = path.join(targetDir, problemFileName);
+ 
+     // Add fields absent in competitive companion.
+     problem.srcPath = srcPath;
+diff --git a/src/copyBundled.ts b/src/copyBundled.ts
+new file mode 100644
+index 0000000..7d14185
+--- /dev/null
++++ b/src/copyBundled.ts
+@@ -0,0 +1,72 @@
++/** [fork] 「提出用にコピー」ボタンの処理 */
++import * as vscode from 'vscode';
++import fs from 'fs';
++import path from 'path';
++import { bundleSource, expandPathVars } from './bundler';
++import { getBundleIncludePaths, getBundleImplMarker } from './preferences';
++
++const BUNDLE_EXTS = new Set(['.cpp', '.cc', '.cxx', '.hpp', '.h', '.c']);
++
++export const copyBundled = async (srcPath: string) => {
++    // 開いているエディタの内容(未保存の変更を含む)を優先して使う
++    const openDoc = vscode.workspace.textDocuments.find(
++        (d) => path.resolve(d.fileName) === path.resolve(srcPath),
++    );
++    let text: string;
++    if (openDoc) {
++        text = openDoc.getText();
++    } else if (fs.existsSync(srcPath)) {
++        text = fs.readFileSync(srcPath, 'utf8');
++    } else {
++        vscode.window.showErrorMessage(`ファイルが見つかりません: ${srcPath}`);
++        return;
++    }
++
++    const ext = path.extname(srcPath).toLowerCase();
++    if (!BUNDLE_EXTS.has(ext)) {
++        await vscode.env.clipboard.writeText(text);
++        vscode.window.showInformationMessage(
++            `${path.basename(srcPath)} をコピーしました`,
++        );
++        return;
++    }
++
++    const workspaceFolder =
++        vscode.workspace.getWorkspaceFolder(vscode.Uri.file(srcPath))?.uri
++            .fsPath ??
++        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ??
++        path.dirname(srcPath);
++    const includePaths = getBundleIncludePaths().map((p) =>
++        expandPathVars(p, workspaceFolder),
++    );
++
++    try {
++        const result = bundleSource(
++            srcPath,
++            text,
++            includePaths,
++            getBundleImplMarker(),
++        );
++        await vscode.env.clipboard.writeText(result.code);
++
++        let msg = `${path.basename(srcPath)} をコピーしました`;
++        if (result.expandedFiles.length > 0) {
++            msg += `(ライブラリ ${result.expandedFiles.length} 個を展開)`;
++        }
++        vscode.window.showInformationMessage(msg);
++
++        if (result.unresolved.length > 0) {
++            vscode.window.showWarningMessage(
++                `見つからない #include があります(そのまま残しました): ${result.unresolved.join(
++                    ', ',
++                )}`,
++            );
++        }
++        for (const w of result.warnings) {
++            vscode.window.showWarningMessage(w);
++        }
++    } catch (err: any) {
++        globalThis.logger.error('Bundle failed', err);
++        vscode.window.showErrorMessage(`展開に失敗しました: ${err.message}`);
++    }
++};
+diff --git a/src/preferences.ts b/src/preferences.ts
+index 612065f..e3f2d5e 100644
+--- a/src/preferences.ts
++++ b/src/preferences.ts
+@@ -249,3 +249,18 @@ export const getLanguageId = (srcPath: string): number => {
+     globalThis.logger.error("Couldn't find id for compiler " + compiler);
+     return -1;
+ };
++
++// ===== [fork] 追加設定 =====
++export const getProblemDirectoryPref = (): string =>
++    getPreference('general.problemDirectory') || '';
++
++export const getProblemFileNamePref = (): string =>
++    getPreference('general.problemFileName') || '';
++
++export const getBundleIncludePaths = (): string[] => {
++    const v = getPreference('bundle.includePaths');
++    return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
++};
++
++export const getBundleImplMarker = (): string =>
++    getPreference('bundle.implMarker') || '@impl';
+diff --git a/src/problemPath.ts b/src/problemPath.ts
+new file mode 100644
+index 0000000..47dfd9e
+--- /dev/null
++++ b/src/problemPath.ts
+@@ -0,0 +1,90 @@
++/**
++ * [fork] Competitive Companion から受け取った問題の保存先パスを決める
++ * (vscode に依存しない純粋なモジュール)
++ */
++import os from 'os';
++import path from 'path';
++
++/** ファイル名・フォルダ名に使えない文字を _ に置き換える */
++export const sanitizeSegment = (s: string): string =>
++    // eslint-disable-next-line no-control-regex
++    s.replace(/[\\/:*?"<>|\x00-\x1f]+/g, '_').trim();
++
++export const getProblemPathVars = (
++    url: string,
++    group: string | undefined,
++    workspaceFolder: string,
++): Record<string, string> => {
++    let contest = '';
++    let task = '';
++    let index = '';
++    // 例: https://atcoder.jp/contests/abc400/tasks/abc400_a
++    const m = url.match(/\/contests\/([^/?#]+)\/tasks\/([^/?#]+)/);
++    if (m) {
++        contest = m[1];
++        task = m[2];
++        index = task.includes('_')
++            ? task.slice(task.lastIndexOf('_') + 1)
++            : task;
++    }
++    return {
++        workspaceFolder,
++        contest: sanitizeSegment(contest),
++        task: sanitizeSegment(task),
++        index: sanitizeSegment(index),
++        group: sanitizeSegment(group ?? ''),
++    };
++};
++
++/** `${name}` を置換する。未知の変数名は unknown に入れ、空文字にする */
++export const applyPathVars = (
++    template: string,
++    vars: Record<string, string>,
++): { value: string; unknown: string[] } => {
++    const unknown: string[] = [];
++    const value = template.replace(/\$\{(\w+)\}/g, (_all, key: string) => {
++        if (key in vars) return vars[key];
++        unknown.push(key);
++        return '';
++    });
++    return { value, unknown };
++};
++
++export type ProblemPathResult = {
++    dir: string;
++    /** 拡張子なしのファイル名。null なら cph 標準の名前を使う */
++    baseName: string | null;
++    unknown: string[];
++};
++
++export const resolveProblemPath = (
++    dirTemplate: string,
++    fileNameTemplate: string,
++    vars: Record<string, string>,
++): ProblemPathResult => {
++    const workspaceFolder = vars.workspaceFolder;
++    const unknown: string[] = [];
++
++    let dir = workspaceFolder;
++    if (dirTemplate.trim() !== '') {
++        const r = applyPathVars(dirTemplate.trim(), vars);
++        unknown.push(...r.unknown);
++        let d = r.value;
++        if (d === '~') {
++            d = os.homedir();
++        } else if (d.startsWith('~/')) {
++            d = path.join(os.homedir(), d.slice(2));
++        }
++        dir = path.resolve(workspaceFolder, d);
++    }
++
++    let baseName: string | null = null;
++    if (fileNameTemplate.trim() !== '') {
++        const r = applyPathVars(fileNameTemplate.trim(), vars);
++        unknown.push(...r.unknown);
++        const b = sanitizeSegment(r.value);
++        // 変数が空になった(AtCoder 以外の URL など)ときは標準の名前に戻す
++        baseName = b === '' || /^[._]+$/.test(b) ? null : b;
++    }
++    return { dir, baseName, unknown: [...new Set(unknown)] };
++};
+diff --git a/src/tests/forkBundler.test.ts b/src/tests/forkBundler.test.ts
+new file mode 100644
+index 0000000..3540b67
+--- /dev/null
++++ b/src/tests/forkBundler.test.ts
+@@ -0,0 +1,207 @@
++import fs from 'fs';
++import os from 'os';
++import path from 'path';
++import { execFileSync } from 'child_process';
++import { bundleSource, stripIncludeGuard } from '../bundler';
++
++let tmp: string;
++let lib: string;
++let ws: string;
++
++const write = (p: string, s: string) => {
++    fs.mkdirSync(path.dirname(p), { recursive: true });
++    fs.writeFileSync(p, s);
++};
++const bundle = (root: string, text: string) =>
++    bundleSource(root, text, [lib], '@impl');
++
++const hasGpp = (() => {
++    try {
++        execFileSync('g++', ['--version']);
++        return true;
++    } catch (_) {
++        return false;
++    }
++})();
++const compileRun = (code: string): string => {
++    const src = path.join(tmp, `t${Math.random()}.cpp`);
++    const exe = src + '.out';
++    fs.writeFileSync(src, code);
++    execFileSync('g++', ['-std=c++20', '-o', exe, src]);
++    return execFileSync(exe).toString().trim();
++};
++
++beforeEach(() => {
++    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cphb-'));
++    lib = path.join(tmp, 'lib');
++    ws = path.join(tmp, 'ws');
++    fs.mkdirSync(ws, { recursive: true });
++    write(
++        path.join(lib, 'gcd.hpp'),
++        '#pragma once\nlong long mygcd(long long a, long long b);\n// @impl\nlong long mygcd(long long a, long long b) { return b ? mygcd(b, a % b) : a; }\n',
++    );
++    write(
++        path.join(lib, 'lcm.hpp'),
++        '#ifndef LCM_HPP\n#define LCM_HPP\n#include "gcd.hpp"\nlong long mylcm(long long a, long long b);\n// @impl\nlong long mylcm(long long a, long long b) { return a / mygcd(a, b) * b; }\n#endif // LCM_HPP\n',
++    );
++    write(
++        path.join(lib, 'uf.hpp'),
++        '#pragma once\n#include <vector>\nstruct UF { std::vector<int> p; UF(int n):p(n,-1){} int find(int x){return p[x]<0?x:p[x]=find(p[x]);} };\n',
++    );
++    write(
++        path.join(lib, 'debug.hpp'),
++        '#pragma once\n#include <iostream>\n#define dump(x) std::cerr << #x << "=" << (x) << "\\n"\nvoid dbg_helper();\n// @impl\nvoid dbg_helper() {}\n',
++    );
++});
++
++afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
++
++describe('fork bundler', () => {
++    test('expands nested includes once, moves @impl after main', () => {
++        const root = path.join(ws, 'a.cpp');
++        const text =
++            '#include <bits/stdc++.h>\n#include "lcm.hpp"\n#include "gcd.hpp"\n#include "uf.hpp"\nusing namespace std;\nint main(){ UF u(3); cout << mylcm(4,6) << " " << mygcd(12,18) << " " << u.find(1) << endl; }\n';
++        write(root, text);
++        const r = bundle(root, text);
++        expect(r.unresolved).toEqual([]);
++        expect(r.expandedFiles.length).toBe(3);
++        expect(r.code).not.toMatch(/#include "/);
++        expect(r.code).not.toMatch(/pragma once|LCM_HPP/);
++        // 宣言は main より前、本体は main より後ろ
++        const mainPos = r.code.indexOf('int main');
++        expect(
++            r.code.indexOf('long long mygcd(long long a, long long b);'),
++        ).toBeLessThan(mainPos);
++        expect(r.code.indexOf('return b ? mygcd')).toBeGreaterThan(mainPos);
++        // gcd は1回だけ
++        expect(r.code.match(/begin: gcd\.hpp/g)?.length).toBe(1);
++        if (hasGpp) expect(compileRun(r.code)).toBe('12 6 1');
++    });
++
++    test('include inside #ifdef LOCAL is not split and stays inside the block', () => {
++        const root = path.join(ws, 'b.cpp');
++        const text =
++            '#include <bits/stdc++.h>\n#ifdef LOCAL\n#include "debug.hpp"\n#else\n#define dump(x)\n#endif\nint main(){ int a = 3; dump(a); std::cout << a << std::endl; }\n';
++        write(root, text);
++        const r = bundle(root, text);
++        const endifPos = r.code.indexOf('#endif');
++        expect(r.code.indexOf('void dbg_helper() {}')).toBeLessThan(endifPos);
++        expect(r.code).not.toMatch(/impl: debug\.hpp/);
++        if (hasGpp) expect(compileRun(r.code)).toBe('3');
++    });
++
++    test('file included conditionally is expanded again when included unconditionally', () => {
++        const root = path.join(ws, 'c.cpp');
++        const text =
++            '#include <bits/stdc++.h>\n#ifdef LOCAL\n#include "gcd.hpp"\n#endif\n#include "gcd.hpp"\nint main(){ std::cout << mygcd(6, 4) << std::endl; }\n';
++        write(root, text);
++        const r = bundle(root, text);
++        if (hasGpp) expect(compileRun(r.code)).toBe('2');
++    });
++
++    test('circular includes do not loop', () => {
++        write(
++            path.join(lib, 'x.hpp'),
++            '#pragma once\n#include "y.hpp"\nint fx();\n',
++        );
++        write(
++            path.join(lib, 'y.hpp'),
++            '#pragma once\n#include "x.hpp"\nint fy();\n',
++        );
++        const root = path.join(ws, 'd.cpp');
++        const text = '#include "x.hpp"\nint main(){}\n';
++        write(root, text);
++        const r = bundle(root, text);
++        expect(r.expandedFiles.length).toBe(2);
++    });
++
++    test('unresolved include is kept and reported', () => {
++        const root = path.join(ws, 'e.cpp');
++        const text =
++            '#include "nothere.hpp"\n#include "nothere.hpp"\nint main(){}\n';
++        write(root, text);
++        const r = bundle(root, text);
++        expect(r.unresolved).toEqual(['nothere.hpp']);
++        expect(r.code).toMatch(/#include "nothere\.hpp"/);
++    });
++
++    test('marker inside #if block is ignored with a warning', () => {
++        write(
++            path.join(lib, 'bad.hpp'),
++            '#pragma once\n#if 1\nint f();\n// @impl\nint f(){return 1;}\n#endif\n',
++        );
++        const root = path.join(ws, 'f.cpp');
++        const text = '#include "bad.hpp"\nint main(){ return f() - 1; }\n';
++        write(root, text);
++        const r = bundle(root, text);
++        expect(r.warnings.length).toBe(1);
++        expect(r.code).not.toMatch(/impl: bad\.hpp/);
++        if (hasGpp) compileRun(r.code);
++    });
++
++    test('marker match is exact (@implementation is not a marker)', () => {
++        write(
++            path.join(lib, 'm.hpp'),
++            '#pragma once\n// @implementation notes\nint g(){return 0;}\n',
++        );
++        const root = path.join(ws, 'g.cpp');
++        const text = '#include "m.hpp"\nint main(){ return g(); }\n';
++        write(root, text);
++        expect(bundle(root, text).code).not.toMatch(/impl: m\.hpp/);
++    });
++
++    test('relative include from the source directory', () => {
++        write(path.join(ws, 'mine', 'h.hpp'), 'int h(){return 0;}\n');
++        const root = path.join(ws, 'h.cpp');
++        const text = '#include "mine/h.hpp"\nint main(){ return h(); }\n';
++        write(root, text);
++        const r = bundle(root, text);
++        expect(r.unresolved).toEqual([]);
++        expect(r.code).toMatch(/int h\(\)/);
++    });
++
++    test('CRLF files work', () => {
++        write(
++            path.join(lib, 'crlf.hpp'),
++            '#pragma once\r\nint k();\r\n// @impl\r\nint k(){return 0;}\r\n',
++        );
++        const root = path.join(ws, 'i.cpp');
++        const text = '#include "crlf.hpp"\r\nint main(){ return k(); }\r\n';
++        write(root, text);
++        const r = bundle(root, text);
++        expect(r.code).not.toMatch(/\r/);
++        expect(r.code.indexOf('int k(){return 0;}')).toBeGreaterThan(
++            r.code.indexOf('int main'),
++        );
++    });
++});
++
++describe('stripIncludeGuard', () => {
++    test('not a guard when #endif closes early', () => {
++        const lines = [
++            '#ifndef A',
++            '#define A',
++            '#endif',
++            'int x;',
++            '#ifdef B',
++            '#endif',
++        ];
++        expect(stripIncludeGuard(lines)).toEqual(lines);
++    });
++    test('strips a real guard', () => {
++        expect(
++            stripIncludeGuard([
++                '// c',
++                '#ifndef A',
++                '#define A',
++                'int x;',
++                '#endif // A',
++                '',
++            ]),
++        ).toEqual(['// c', 'int x;', '']);
++    });
++    test('#define with value is not a guard', () => {
++        const lines = ['#ifndef N', '#define N 100', '#endif'];
++        expect(stripIncludeGuard(lines)).toEqual(lines);
++    });
++});
+diff --git a/src/tests/forkProblemPath.test.ts b/src/tests/forkProblemPath.test.ts
+new file mode 100644
+index 0000000..10bfa1e
+--- /dev/null
++++ b/src/tests/forkProblemPath.test.ts
+@@ -0,0 +1,66 @@
++import os from 'os';
++import path from 'path';
++import { getProblemPathVars, resolveProblemPath } from '../problemPath';
++
++const ws = '/home/u/atcoder';
++const vars = getProblemPathVars(
++    'https://atcoder.jp/contests/abc400/tasks/abc400_a?lang=ja',
++    'AtCoder - AtCoder Beginner Contest 400',
++    ws,
++);
++
++describe('fork problem path', () => {
++    test('vars from AtCoder URL', () => {
++        expect(vars.contest).toBe('abc400');
++        expect(vars.task).toBe('abc400_a');
++        expect(vars.index).toBe('a');
++    });
++    test('empty settings keep cph default', () => {
++        expect(resolveProblemPath('', '', vars)).toEqual({
++            dir: ws,
++            baseName: null,
++            unknown: [],
++        });
++    });
++    test('contest folder + index file', () => {
++        const r = resolveProblemPath(
++            '${workspaceFolder}/${contest}',
++            '${index}',
++            vars,
++        );
++        expect(r.dir).toBe('/home/u/atcoder/abc400');
++        expect(r.baseName).toBe('a');
++    });
++    test('relative and ~ paths', () => {
++        expect(resolveProblemPath('contests/${contest}', '', vars).dir).toBe(
++            '/home/u/atcoder/contests/abc400',
++        );
++        expect(resolveProblemPath('~/cp/${contest}', '', vars).dir).toBe(
++            path.join(os.homedir(), 'cp/abc400'),
++        );
++    });
++    test('non-AtCoder URL falls back to default name', () => {
++        const v = getProblemPathVars(
++            'https://codeforces.com/problemset/problem/1/A',
++            'Codeforces',
++            ws,
++        );
++        const r = resolveProblemPath(
++            '${workspaceFolder}/${contest}',
++            '${index}',
++            v,
++        );
++        expect(r.dir).toBe(ws);
++        expect(r.baseName).toBeNull();
++    });
++    test('unknown variables are reported', () => {
++        expect(
++            resolveProblemPath('${foo}', '${bar}_${index}', vars).unknown,
++        ).toEqual(['foo', 'bar']);
++    });
++    test('file name cannot escape directory', () => {
++        expect(resolveProblemPath('', '../${index}', vars).baseName).toBe(
++            '.._a',
++        );
++    });
++});
+diff --git a/src/types.ts b/src/types.ts
+index e6e87a0..9da7627 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -61,7 +61,11 @@ export type prefSection =
+     | 'general.doTemplateFileVariableReplacement'
+     | 'general.remoteServerAddress'
+     | 'general.showLiveUserCount'
+-    | 'general.hideOutputDifference';
++    | 'general.hideOutputDifference'
++    | 'general.problemDirectory'
++    | 'general.problemFileName'
++    | 'bundle.includePaths'
++    | 'bundle.implMarker';
+ 
+ export type Language = {
+     name: LangNames;
+@@ -223,7 +227,13 @@ export type OpenFile = {
+     path: string;
+ };
+ 
++/** [fork] 提出用にコピー */
++export type CopyBundled = {
++    command: 'copy-bundled';
++} & WebviewMessageCommon;
++
+ export type WebviewToVSEvent =
++    | CopyBundled
+     | RunAllCommand
+     | GetInitialProblem
+     | CreateLocalProblem
+diff --git a/src/webview/JudgeView.ts b/src/webview/JudgeView.ts
+index f146318..cd9bc7e 100644
+--- a/src/webview/JudgeView.ts
++++ b/src/webview/JudgeView.ts
+@@ -25,6 +25,7 @@ import {
+ import { setOnlineJudgeEnv, onlineJudgeEnv } from '../compiler';
+ import { translations } from './translations';
+ import { serializeForInlineScript } from '../utilsPure';
++import { copyBundled } from '../copyBundled';
+ 
+ class JudgeViewProvider implements vscode.WebviewViewProvider {
+     public static readonly viewType = 'cph.judgeView';
+@@ -54,6 +55,11 @@ class JudgeViewProvider implements vscode.WebviewViewProvider {
+             async (message: WebviewToVSEvent) => {
+                 globalThis.logger.log('Got from webview', message);
+                 switch (message.command) {
++                    case 'copy-bundled': {
++                        await copyBundled(message.problem.srcPath);
++                        break;
++                    }
++
+                     case 'run-single-and-save': {
+                         const problem = message.problem;
+                         const id = message.id;
+diff --git a/src/webview/frontend/App.tsx b/src/webview/frontend/App.tsx
+index 77dcac5..23140a1 100644
+--- a/src/webview/frontend/App.tsx
++++ b/src/webview/frontend/App.tsx
+@@ -434,6 +434,14 @@ function Judge(props: {
+         setWaitingForSubmit(true);
+     };
+ 
++    // [fork] 提出用にコピー(自作ライブラリを展開してクリップボードへ)
++    const copyBundled = () => {
++        sendMessageToVSCode({
++            command: 'copy-bundled',
++            problem,
++        });
++    };
++
+     const submitCf = () => {
+         sendMessageToVSCode({
+             command: 'submitCf',
+@@ -951,6 +959,16 @@ function Judge(props: {
+                             </span>{' '}
+                             {t('newTestcase')}
+                         </button>
++                        <button
++                            className="btn btn-block"
++                            onClick={copyBundled}
++                            title={t('copyForSubmit')}
++                        >
++                            <span className="icon">
++                                <i className="codicon codicon-copy"></i>
++                            </span>{' '}
++                            {t('copyForSubmit')}
++                        </button>
+                         {renderSubmitButton()}
+                     </div>
+                     {waitingForSubmit && (
+diff --git a/src/webview/translations.ts b/src/webview/translations.ts
+index 04ac6f2..df427eb 100644
+--- a/src/webview/translations.ts
++++ b/src/webview/translations.ts
+@@ -37,6 +37,7 @@ export const translations: Record<string, any> = {
+         failed: 'failed',
+         passedRate: 'passed',
+         newTestcase: 'New Testcase',
++        copyForSubmit: 'Copy for Submit',
+         setOnlineJudge: 'Set ONLINE_JUDGE',
+         support: 'Support',
+         feedback: 'Feedback',
+@@ -195,6 +196,7 @@ export const translations: Record<string, any> = {
+         failed: '失敗',
+         passedRate: '通過',
+         newTestcase: '新增測試案例',
++        copyForSubmit: '複製以提交',
+         setOnlineJudge: '設定 ONLINE_JUDGE',
+         support: '支持',
+         feedback: '意見回饋',
+@@ -344,6 +346,7 @@ export const translations: Record<string, any> = {
+         failed: '失败',
+         passedRate: '通过',
+         newTestcase: '新建测试用例',
++        copyForSubmit: '复制以提交',
+         setOnlineJudge: '设置 ONLINE_JUDGE',
+         support: '支持',
+         feedback: '反馈',
+@@ -493,6 +496,7 @@ export const translations: Record<string, any> = {
+         failed: '실패',
+         passedRate: '통과',
+         newTestcase: '새 테스트케이스',
++        copyForSubmit: '제출용 복사',
+         setOnlineJudge: 'Set ONLINE_JUDGE',
+         support: '후원',
+         feedback: '피드백',
+@@ -647,6 +651,7 @@ export const translations: Record<string, any> = {
+         failed: '失敗',
+         passedRate: '成功',
+         newTestcase: '新しいテストケース',
++        copyForSubmit: '提出用にコピー',
+         setOnlineJudge: 'ONLINE_JUDGE を設定',
+         support: 'サポート',
+         feedback: 'フィードバック',

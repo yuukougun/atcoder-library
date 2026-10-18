@@ -1,0 +1,18 @@
+# コンパイルで生成されるファイル
+*.out
+*.o
+*.exe
+*.gch
+
+# cphのテストケース保存フォルダ(ライブラリの動作確認を cph でした場合)
+.cph/
+
+# ライブラリの動作確認用の作業フォルダ
+test/
+
+# エディタ・OSが作るファイル
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
